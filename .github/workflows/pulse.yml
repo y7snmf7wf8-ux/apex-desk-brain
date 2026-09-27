@@ -1,0 +1,29 @@
+name: pulse
+on:
+  schedule:
+    - cron: "*/15 0-20 * * 1-5"
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: apex-brain
+  cancel-in-progress: false
+jobs:
+  pulse:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - uses: actions/checkout@v4
+      - name: Pulse
+        env:
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+          APEX_URL: https://apex-desk-nine.vercel.app/api/apex/pulse
+        run: node pulse.mjs
+      - name: Save
+        run: |
+          git config user.name "apex-desk"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add brain.json
+          git diff --cached --quiet && exit 0
+          git commit -m "pulse"
+          git push
