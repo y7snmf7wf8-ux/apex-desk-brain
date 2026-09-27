@@ -5,6 +5,7 @@ on:
   workflow_dispatch:
 permissions:
   contents: write
+  id-token: write
 concurrency:
   group: apex-brain
   cancel-in-progress: false
@@ -16,7 +17,6 @@ jobs:
       - uses: actions/checkout@v4
       - name: Pulse
         env:
-          CRON_SECRET: ${{ secrets.CRON_SECRET }}
           APEX_URL: https://apex-desk-nine.vercel.app/api/apex/pulse
         run: node pulse.mjs
       - name: Save
