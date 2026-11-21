@@ -1,29 +1,40 @@
 name: pulse
 on:
   schedule:
-    - cron: "*/15 0-20 * * 1-5"
+    # Seeds only. GitHub drops most of these. Whichever starts holds the session
+    # and chains itself before the close so the buy window is actually watched.
+    - cron: "11 9 * * 1-5"
+    - cron: "17 12 * * 1-5"
+    - cron: "29 14 * * 1-5"
+    - cron: "41 16 * * 1-5"
+    - cron: "7 19 * * 1-5"
+    - cron: "47 1 * * 2-6"
   workflow_dispatch:
 permissions:
   contents: write
   id-token: write
+  actions: write
 concurrency:
   group: apex-brain
   cancel-in-progress: false
 jobs:
   pulse:
     runs-on: ubuntu-latest
-    timeout-minutes: 2
+    timeout-minutes: 360
     steps:
       - uses: actions/checkout@v4
       - name: Pulse
         env:
           APEX_URL: https://apex-desk-nine.vercel.app/api/apex/pulse
-        run: node pulse.mjs
-      - name: Save
         run: |
           git config user.name "apex-desk"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add brain.json
-          git diff --cached --quiet && exit 0
-          git commit -m "pulse"
-          git push
+          node pulse.mjs
+      - name: Continue the watch
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ -f .continue ]; then
+            gh workflow run pulse.yml --ref main
+          fi
