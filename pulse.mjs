@@ -11,6 +11,7 @@ const ET = "America/New_York";
 const SESSION_START = 4 * 60;
 const SESSION_END = 16 * 60 + 5;
 const MAX_MS = (5 * 60 + 40) * 60 * 1000;
+const FAR_MS = 20 * 60 * 60 * 1000;
 
 function etNow(date = new Date()) {
   const fmt = new Intl.DateTimeFormat("en-US", {
@@ -25,36 +26,50 @@ function etNow(date = new Date()) {
     if (part.type !== "literal") bag[part.type] = part.value;
   }
   const weekday = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 }[bag.weekday] ?? 0;
-  const hours = Number(bag.hour);
+  let hours = Number(bag.hour);
+  if (hours === 24) hours = 0;
   const minutes = Number(bag.minute);
-  return { weekday, minuteOfDay: hours * 60 + minutes, label: `${bag.hour}:${bag.minute} ET` };
+  return { weekday, minuteOfDay: hours * 60 + minutes, label: `${String(hours).padStart(2, "0")}:${bag.minute} ET` };
 }
 
 function inSession(now = etNow()) {
   return now.weekday >= 1 && now.weekday <= 5 && now.minuteOfDay >= SESSION_START && now.minuteOfDay < SESSION_END;
 }
 
-let authorization = "";
-if (process.env.ACTIONS_ID_TOKEN_REQUEST_URL && process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN) {
-  const tokenUrl = `${process.env.ACTIONS_ID_TOKEN_REQUEST_URL}&audience=apex-desk`;
-  const tokenRes = await fetch(tokenUrl, {
-    headers: { Authorization: `bearer ${process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN}` },
-  });
-  if (!tokenRes.ok) {
-    console.error("oidc failed", tokenRes.status);
-    process.exit(1);
+function msUntilNextSession() {
+  const cur = etNow();
+  let addDays = 0;
+  if (cur.weekday === 0) addDays = 1;
+  else if (cur.weekday === 6) addDays = 2;
+  else if (cur.minuteOfDay >= SESSION_START) addDays = cur.weekday === 5 ? 3 : 1;
+  const deltaMin =
+    addDays === 0 ? SESSION_START - cur.minuteOfDay : addDays * 24 * 60 - cur.minuteOfDay + SESSION_START;
+  return deltaMin * 60 * 1000;
+}
+
+async function sleep(ms) {
+  let left = ms;
+  while (left > 0) {
+    const chunk = Math.min(5 * 60 * 1000, left);
+    await new Promise((resolve) => setTimeout(resolve, chunk));
+    left -= chunk;
+    if (left > 0) console.log("awake", etNow().label, `${Math.round(left / 60000)}m left`);
   }
-  const tokenBody = await tokenRes.json();
-  if (!tokenBody.value) {
-    console.error("oidc empty");
-    process.exit(1);
+}
+
+async function authHeader() {
+  if (process.env.ACTIONS_ID_TOKEN_REQUEST_URL && process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN) {
+    const tokenUrl = `${process.env.ACTIONS_ID_TOKEN_REQUEST_URL}&audience=apex-desk`;
+    const tokenRes = await fetch(tokenUrl, {
+      headers: { Authorization: `bearer ${process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN}` },
+    });
+    if (!tokenRes.ok) throw new Error(`oidc ${tokenRes.status}`);
+    const tokenBody = await tokenRes.json();
+    if (!tokenBody.value) throw new Error("oidc empty");
+    return `Bearer ${tokenBody.value}`;
   }
-  authorization = `Bearer ${tokenBody.value}`;
-} else if (process.env.CRON_SECRET) {
-  authorization = `Bearer ${process.env.CRON_SECRET}`;
-} else {
-  console.error("no auth");
-  process.exit(1);
+  if (process.env.CRON_SECRET) return `Bearer ${process.env.CRON_SECRET}`;
+  throw new Error("no auth");
 }
 
 function saveBrain() {
@@ -64,11 +79,17 @@ function saveBrain() {
     return;
   } catch {
     execSync('git commit -m "pulse"');
-    execSync("git push");
+    try {
+      execSync("git push");
+    } catch {
+      execSync("git pull --rebase -X theirs");
+      execSync("git push");
+    }
   }
 }
 
 async function onePulse() {
+  const authorization = await authHeader();
   const cur = JSON.parse(fs.readFileSync("brain.json", "utf8"));
   const res = await fetch(url, {
     method: "POST",
@@ -86,26 +107,61 @@ async function onePulse() {
   console.log("ok", etNow().label, next.blob.length, next.decision || "", next.ticker || "");
 }
 
-const started = Date.now();
-if (!inSession()) {
-  await onePulse();
-  process.exit(0);
+function handoff() {
+  fs.writeFileSync(".continue", "1");
+  console.log("continue");
 }
 
-while (inSession()) {
+const started = Date.now();
+
+while (true) {
+  if (Date.now() - started >= MAX_MS) {
+    handoff();
+    break;
+  }
+  const now = etNow();
+  if (inSession(now)) {
+    try {
+      await onePulse();
+    } catch (err) {
+      console.error("pulse error", err instanceof Error ? err.message : err);
+    }
+    if (!inSession()) break;
+    if (Date.now() - started >= MAX_MS) {
+      handoff();
+      break;
+    }
+    const tight = now.minuteOfDay >= 9 * 60 + 20 && now.minuteOfDay < 15 * 60 + 50;
+    await sleep((tight ? 4 : 10) * 60 * 1000);
+    continue;
+  }
+
+  const until = msUntilNextSession();
+  if (until > FAR_MS) {
+    try {
+      await onePulse();
+    } catch (err) {
+      console.error("pulse error", err instanceof Error ? err.message : err);
+    }
+    console.log("next session is far", Math.round(until / 3600000), "h");
+    break;
+  }
+
+  const budget = MAX_MS - (Date.now() - started) - 90_000;
+  if (until + 60_000 < budget) {
+    console.log("waiting for the open", Math.round(until / 60000), "min");
+    await sleep(until);
+    continue;
+  }
+
   try {
     await onePulse();
   } catch (err) {
     console.error("pulse error", err instanceof Error ? err.message : err);
   }
-  const now = etNow();
-  if (!inSession(now)) break;
-  if (Date.now() - started >= MAX_MS) {
-    fs.writeFileSync(".continue", "1");
-    console.log("continue");
-    process.exit(0);
-  }
-  const tight = now.minuteOfDay >= 9 * 60 + 20 && now.minuteOfDay < 15 * 60 + 50;
-  const waitMs = (tight ? 4 : 10) * 60 * 1000;
-  await new Promise((resolve) => setTimeout(resolve, waitMs));
+  const nap = Math.max(30_000, MAX_MS - (Date.now() - started) - 90_000);
+  console.log("handing off in", Math.round(nap / 60000), "min");
+  await sleep(nap);
+  handoff();
+  break;
 }
